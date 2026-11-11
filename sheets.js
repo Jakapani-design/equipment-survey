@@ -4,10 +4,10 @@ window.SheetConnection = (() => {
   const config = window.SURVEY_CONFIG;
   const scope = 'https://www.googleapis.com/auth/spreadsheets';
   const tabs = ['01 PC1','02 PC2','03 PC3','04 Cash Drawer','05 IPAD SR','06 IPAD SALE','07 IPAD DOCTOR','08 IPAD SP','09 IPAD NURSE','10 Webcam','11 Fingerprint Scanner','12 ReceiptPrinter','13 ID Card Reader1','14 ID Card Reader2','15 Passport Reader','16 Credit Card Reader','17 QR Code Reader-Barcode Reade'];
-  let token = '', expiry = 0, client = null, sheetIds = null;
+  let token = '', expiry = 0, client = null, sheetIds = null, branchRows = new Map();
   const root = 'https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(config.spreadsheetId);
   const quote = s => "'" + s.replaceAll("'", "''") + "'";
-  const normalized = row => Array.from({length:5}, (_,i) => row[i] ?? '');
+  const normalized = row => Array.from({length:6}, (_,i) => row[i] ?? '');
   const version = row => JSON.stringify(normalized(row));
   const dateText = v => typeof v === 'number' ? new Date(Math.round((v-25569)*86400000)).toISOString().slice(0,10) : String(v || '');
   function connected() { return !!token && Date.now() < expiry; }
@@ -22,22 +22,29 @@ window.SheetConnection = (() => {
     return result;
   }
   async function ranges(list) {
-    const query=new URLSearchParams({valueRenderOption:'UNFORMATTED_VALUE',dateTimeRenderOption:'SERIAL_NUMBER'});
-    list.forEach(r=>query.append('ranges',r));return (await request('/values:batchGet?'+query)).valueRanges||[];
+    const values=[];
+    for(let start=0;start<list.length;start+=50){
+      const query=new URLSearchParams({valueRenderOption:'UNFORMATTED_VALUE',dateTimeRenderOption:'SERIAL_NUMBER'});
+      list.slice(start,start+50).forEach(r=>query.append('ranges',r));
+      values.push(...((await request('/values:batchGet?'+query)).valueRanges||[]));
+    }
+    return values;
   }
   function record(row,index) {
     const cells=Array.from({length:8},(_,i)=>row[i]??'');
-    return {row:index,branch:String(cells[1]),quantity:cells[2],reason:String(cells[3]),surveyor:String(cells[4]),date:dateText(cells[5]),note:String(cells[6]),status:String(cells[7]),version:version(cells.slice(2,7))};
+    return {row:index,branch:String(cells[1]),quantity:cells[2],reason:String(cells[3]),surveyor:String(cells[4]),date:dateText(cells[5]),note:String(cells[6]),status:String(cells[7]),version:version(cells.slice(1,7))};
   }
   async function getSurvey() {
-    if(!sheetIds){const m=await request('?fields=sheets.properties(sheetId,title)');sheetIds=new Map(m.sheets.map(s=>[s.properties.title,s.properties.sheetId]));}
+    const m=await request('?fields=sheets.properties(sheetId,title)');sheetIds=new Map(m.sheets.map(s=>[s.properties.title,s.properties.sheetId]));
     tabs.forEach(t=>{if(!sheetIds.has(t))throw Error('ไม่พบแท็บ '+t);});
-    const blocks=await ranges([quote('สรุปและผู้สำรวจ')+'!B8:B24',...tabs.map(t=>quote(t)+'!A6:H98')]);
+    const blocks=await ranges([quote('สรุปและผู้สำรวจ')+'!B8:B24',...tabs.map(t=>quote(t)+'!A6:H')]);
     const owners=blocks[0]?.values||[];
-    return {equipment:tabs.map((t,i)=>({id:i,name:i===16?'QR Code Reader/Barcode Reader':t.slice(3),owner:String(owners[i]?.[0]||''),records:Array.from({length:93},(_,j)=>record(blocks[i+1]?.values?.[j]||[],j+6))})),loadedAt:new Date().toISOString()};
+    const equipment=tabs.map((t,i)=>({id:i,name:i===16?'QR Code Reader/Barcode Reader':t.slice(3),owner:String(owners[i]?.[0]||''),records:(blocks[i+1]?.values||[]).map((r,j)=>record(r,j+6)).filter(r=>r.branch.trim()!=='')}));
+    branchRows=new Map(equipment.map(e=>[e.id,new Set(e.records.map(r=>r.row))]));
+    return {equipment,loadedAt:new Date().toISOString()};
   }
   function validate(p) {
-    if(!p||!Number.isInteger(p.equipment)||p.equipment<0||p.equipment>=tabs.length||!Number.isInteger(p.row)||p.row<6||p.row>98)throw Error('รายการไม่ถูกต้อง');
+    if(!p||!Number.isInteger(p.equipment)||p.equipment<0||p.equipment>=tabs.length||!Number.isSafeInteger(p.row)||p.row<6)throw Error('รายการไม่ถูกต้อง');
     if(typeof p.quantity!=='number'||!Number.isSafeInteger(p.quantity)||p.quantity<0)throw Error('กรอกจำนวนเต็มตั้งแต่ 0 ขึ้นไป');
     if(p.quantity>1&&!String(p.reason||'').trim())throw Error('กรุณาระบุเหตุผลเมื่อจำนวนมากกว่า 1');
     if(!String(p.surveyor||'').trim())throw Error('กรุณาระบุผู้สำรวจ');
@@ -45,11 +52,12 @@ window.SheetConnection = (() => {
     if(!/^\d{4}-\d{2}-\d{2}$/.test(p.date||'')||!Number.isFinite(Date.parse(p.date+'T00:00:00Z'))||new Date(p.date+'T00:00:00Z').toISOString().slice(0,10)!==p.date)throw Error('วันที่ไม่ถูกต้อง');
   }
   async function saveMany(items) {
-    if(!Array.isArray(items)||items.length<1||items.length>93)throw Error('จำนวนแถวไม่ถูกต้อง');
+    if(!Array.isArray(items)||items.length<1)throw Error('จำนวนแถวไม่ถูกต้อง');
     items.forEach(validate);const keys=items.map(p=>p.equipment+':'+p.row);if(new Set(keys).size!==items.length)throw Error('มีแถวซ้ำ');
     if(!sheetIds)await getSurvey();
-    const before=await ranges(items.map(p=>quote(tabs[p.equipment])+'!C'+p.row+':G'+p.row));
-    items.forEach((p,i)=>{if(version(before[i]?.values?.[0]||[])!==p.version)throw Error('ข้อมูลสาขาแถว '+p.row+' เปลี่ยนแล้ว กรุณาโหลดใหม่ก่อนบันทึก');});
+    if(items.some(p=>!branchRows.get(p.equipment)?.has(p.row)))throw Error('ไม่พบสาขาในข้อมูลที่โหลด กรุณาโหลดข้อมูลใหม่');
+    const before=await ranges(items.map(p=>quote(tabs[p.equipment])+'!B'+p.row+':H'+p.row));
+    items.forEach((p,i)=>{if(version((before[i]?.values?.[0]||[]).slice(0,6))!==p.version)throw Error('ข้อมูลสาขาแถว '+p.row+' เปลี่ยนแล้ว กรุณาโหลดใหม่ก่อนบันทึก');});
     const requests=items.map(p=>({updateCells:{range:{sheetId:sheetIds.get(tabs[p.equipment]),startRowIndex:p.row-1,endRowIndex:p.row,startColumnIndex:2,endColumnIndex:7},rows:[{values:[
       {userEnteredValue:{numberValue:p.quantity}},
       {userEnteredValue:{stringValue:String(p.reason||'').trim()}},
@@ -57,6 +65,10 @@ window.SheetConnection = (() => {
       {userEnteredValue:{numberValue:Date.parse(p.date+'T00:00:00Z')/86400000+25569}},
       {userEnteredValue:{stringValue:String(p.note||'').trim()}}
     ]}],fields:'userEnteredValue'}}));
+    items.forEach((p,i)=>{if(!(before[i]?.values?.[0]?.[6]??'')){
+      const row=p.row; const f='=IF(C'+row+'="","ยังไม่สำรวจ",IF(AND(C'+row+'>1,LEN(TRIM(D'+row+'))=0),"กรอกเหตุผล",IF(AND(LEN(TRIM(E'+row+'))=0,LEN(TRIM($B$2))=0),"ระบุผู้สำรวจ",IF(F'+row+'="","ระบุวันที่สำรวจ","ครบแล้ว"))))';
+      requests.push({updateCells:{start:{sheetId:sheetIds.get(tabs[p.equipment]),rowIndex:row-1,columnIndex:7},rows:[{values:[{userEnteredValue:{formulaValue:f}}]}],fields:'userEnteredValue'}});
+    }});
     await request(':batchUpdate',{method:'POST',body:JSON.stringify({requests})});
     const after=await ranges(items.map(p=>quote(tabs[p.equipment])+'!A'+p.row+':H'+p.row));
     return items.map((p,i)=>record(after[i]?.values?.[0]||[],p.row));

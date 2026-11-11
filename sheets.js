@@ -32,7 +32,7 @@ window.SheetConnection = (() => {
   }
   function record(row,index) {
     const cells=Array.from({length:8},(_,i)=>row[i]??'');
-    return {row:index,branch:String(cells[1]),quantity:cells[2],reason:String(cells[3]),surveyor:String(cells[4]),date:dateText(cells[5]),note:String(cells[6]),status:String(cells[7]),version:version(cells.slice(1,7))};
+    return {order:cells[0],row:index,branch:String(cells[1]),quantity:cells[2],reason:String(cells[3]),surveyor:String(cells[4]),date:dateText(cells[5]),note:String(cells[6]),status:String(cells[7]),version:version(cells.slice(1,7))};
   }
   async function getSurvey() {
     const m=await request('?fields=sheets.properties(sheetId,title)');sheetIds=new Map(m.sheets.map(s=>[s.properties.title,s.properties.sheetId]));
@@ -73,6 +73,36 @@ window.SheetConnection = (() => {
     const after=await ranges(items.map(p=>quote(tabs[p.equipment])+'!A'+p.row+':H'+p.row));
     return items.map((p,i)=>record(after[i]?.values?.[0]||[],p.row));
   }
+
+  async function addBranch(input) {
+    const code=String(input?.code||'').trim().toUpperCase(), name=String(input?.name||'').trim().replace(/\s+/g,' ');
+    if(!/^[A-Z0-9][A-Z0-9_-]{0,19}$/.test(code))throw Error('รหัสสาขาต้องเป็นตัวอักษรอังกฤษหรือตัวเลข 1–20 ตัว ใช้ - หรือ _ ได้');
+    if(!name||name.length>150)throw Error('กรอกชื่อสาขา 1–150 ตัวอักษร');
+    const branch=code+' - '+name;
+    const fresh=await getSurvey();
+    for(const equipment of fresh.equipment)for(const r of equipment.records){
+      const current=r.branch.trim(),existingCode=current.split(/\s+-\s+/)[0].trim().toUpperCase();
+      if(existingCode===code||current.toLocaleLowerCase()===branch.toLocaleLowerCase())throw Error('มีรหัสสาขา '+code+' อยู่แล้วใน '+equipment.name+' จึงไม่ได้เพิ่มข้อมูล');
+    }
+    const status='=IF(INDEX(C:C,ROW())="","ยังไม่สำรวจ",IF(AND(INDEX(C:C,ROW())>1,LEN(TRIM(INDEX(D:D,ROW())))=0),"กรอกเหตุผล",IF(AND(LEN(TRIM(INDEX(E:E,ROW())))=0,LEN(TRIM($B$2))=0),"ระบุผู้สำรวจ",IF(INDEX(F:F,ROW())="","ระบุวันที่สำรวจ","ครบแล้ว"))))';
+    const requests=fresh.equipment.map(e=>{
+      const nextNumber=e.records.reduce((max,r)=>Math.max(max,Number(r.order)||0),0)+1;
+      const format={textFormat:{fontFamily:'Arial',fontSize:11},verticalAlignment:'MIDDLE',wrapStrategy:'WRAP'};
+      const cells=[
+        {userEnteredValue:{numberValue:nextNumber}},
+        {userEnteredValue:{stringValue:branch}},
+        {},{},{},
+        {userEnteredFormat:{...format,numberFormat:{type:'DATE',pattern:'dd/mm/yyyy'}}},
+        {},
+        {userEnteredValue:{formulaValue:status}}
+      ].map(c=>({userEnteredFormat:format,...c}));
+      cells[2].dataValidation={condition:{type:'CUSTOM_FORMULA',values:[{userEnteredValue:'=OR(ISBLANK(INDEX(C:C,ROW())),AND(ISNUMBER(INDEX(C:C,ROW())),INDEX(C:C,ROW())>=0,MOD(INDEX(C:C,ROW()),1)=0))'}]},strict:true,inputMessage:'จำนวนเต็มตั้งแต่ 0 ขึ้นไป'};
+      return {appendCells:{sheetId:sheetIds.get(tabs[e.id]),rows:[{values:cells}],fields:'userEnteredValue,userEnteredFormat,dataValidation'}};
+    });
+    await request(':batchUpdate',{method:'POST',body:JSON.stringify({requests})});
+    return getSurvey();
+  }
+
   function connect() {
     if(!config.clientId||!config.clientId.endsWith('.apps.googleusercontent.com'))return Promise.reject(Error('ยังไม่ได้ตั้งค่า Google OAuth Client ID ใน config.js'));
     if(!window.google?.accounts?.oauth2)return Promise.reject(Error('กำลังโหลด Google Sign-In กรุณาลองใหม่ หรือตรวจว่าบราวเซอร์ไม่ได้บล็อก accounts.google.com'));
@@ -82,5 +112,5 @@ window.SheetConnection = (() => {
     });
   }
   async function disconnect(){const current=token;forget();if(current&&window.google?.accounts?.oauth2)await new Promise(resolve=>google.accounts.oauth2.revoke(current,resolve));}
-  return {connect,disconnect,connected,getSurvey,saveMany,saveSurvey:async p=>(await saveMany([p]))[0]};
+  return {connect,disconnect,connected,getSurvey,addBranch,saveMany,saveSurvey:async p=>(await saveMany([p]))[0]};
 })();
